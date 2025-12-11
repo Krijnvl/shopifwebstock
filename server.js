@@ -10,17 +10,20 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
+// WebStock config
 const WEBSTOCK_BASE_URL = "https://altena.webstock.nl/wsapp/api/v1";
 const WEBSTOCK_USER = process.env.WEBSTOCK_USER;
 const WEBSTOCK_PASS = process.env.WEBSTOCK_PASS;
-const WEBSTOCK_WAREHOUSE = "Test";
-const WEBSTOCK_ORDER_PREFIX = "GWT";
+const WEBSTOCK_WAREHOUSE = "Test";       // Test-magazijn
+const WEBSTOCK_ORDER_PREFIX = "GWT";     // Prefix voor SalesOrderNumber
 
+// Shopify webhook secret (van je webhook in Shopify)
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
-const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN; // bv. beatbox-binc.myshopify.com
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
 
 // ---------------- PRODUCT MAPPING (TITEL → EAN) ----------------
+//
+// We gebruiken EAN als ArticleNumber in WebStock.
+//
 
 const TITLE_TO_EAN_MAP = {
   "fruit punch": "8720892642738",
@@ -45,7 +48,7 @@ function resolveArticleFromItem(item) {
     };
   }
 
-  // fallback
+  // Fallback als er geen match is
   return {
     articleNumber: item.sku || item.title || "UNKNOWN",
     ean: "",
@@ -54,6 +57,7 @@ function resolveArticleFromItem(item) {
 
 // ---------------- HELPERS ----------------
 
+// HMAC-check voor Shopify webhooks
 function verifyShopifyHmac(rawBody, hmacHeader) {
   if (!SHOPIFY_WEBHOOK_SECRET || !hmacHeader) return false;
 
@@ -72,6 +76,7 @@ function verifyShopifyHmac(rawBody, hmacHeader) {
   }
 }
 
+// Eén line item uit Shopify → één orderregel in WebStock
 function mapLineItemToWebStockLine(item) {
   const { articleNumber, ean } = resolveArticleFromItem(item);
 
@@ -81,7 +86,7 @@ function mapLineItemToWebStockLine(item) {
     ArticleId: 0,
     ArticleExternId: 0,
     ArticleExternGuid: "",
-    ArticleNumber: articleNumber,
+    ArticleNumber: articleNumber,    // EAN als artikelnummer
     Eancode: ean,
     PackagingUnit: "st",
     PackagingQuantity: 1,
@@ -99,6 +104,7 @@ function mapLineItemToWebStockLine(item) {
   };
 }
 
+// Hele Shopify order → WebStock SalesOrder payload
 function buildWebStockOrderFromShopify(order) {
   const shipping = order.shipping_address || {};
   const customer = order.customer || {};
@@ -110,12 +116,14 @@ function buildWebStockOrderFromShopify(order) {
     order.name;
 
   return {
+    // Externe referenties
     SalesOrderExternId: order.id,
     SalesOrderExternGuid: order.admin_graphql_api_id || "",
     SalesOrderExternParentId: 0,
 
+    // Orderheader
     SalesOrderNumber: finalOrderNumber,
-    Status: 10,
+    Status: 10, // New
 
     CustomerId: 0,
     CustomerNumber: customer.id ? String(customer.id) : "",
@@ -129,13 +137,14 @@ function buildWebStockOrderFromShopify(order) {
     HandlingDate: null,
     ReadyDate: null,
 
-    CustomerReference: order.name,
+    CustomerReference: order.name, // bijv. "#1001"
     SalesOrderDescription: `Shopify order ${order.name}`,
 
     DeliveryTerms: "",
     ShippingDetails: "",
     SalesOrderDocuments: "",
 
+    // Adres 1 = shipping address
     AddressContactPerson1: shipping.name || "",
     AddressAttention1: "",
     AddressStreet1: shipping.address1 || "",
@@ -147,6 +156,7 @@ function buildWebStockOrderFromShopify(order) {
     AddressPhonenumber1: shipping.phone || order.phone || "",
     AddressEmail1: order.email || order.contact_email || "",
 
+    // Adres 2 leeg
     Address2Name: "",
     AddressContactPerson2: "",
     AddressAttention2: "",
@@ -161,10 +171,12 @@ function buildWebStockOrderFromShopify(order) {
 
     WareHouse: WEBSTOCK_WAREHOUSE,
 
+    // Orderregels
     OrderLines: (order.line_items || []).map(mapLineItemToWebStockLine),
   };
 }
 
+// Call naar WebStock
 async function sendOrderToWebStock(orderPayload) {
   const url = `${WEBSTOCK_BASE_URL}/SalesOrders`;
   const auth = Buffer.from(`${WEBSTOCK_USER}:${WEBSTOCK_PASS}`).toString(
@@ -191,32 +203,6 @@ async function sendOrderToWebStock(orderPayload) {
   return text;
 }
 
-// Shopify Admin API: order ophalen op basis van ID
-async function fetchShopifyOrder(orderId) {
-  if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ADMIN_TOKEN) {
-    throw new Error("SHOPIFY_STORE_DOMAIN of SHOPIFY_ADMIN_TOKEN ontbreekt");
-  }
-
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2025-01/orders/${orderId}.json`;
-
-  const res = await fetch(url, {
-    method: "GET",
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
-      "Content-Type": "application/json",
-    },
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    console.error("❌ Fout bij ophalen order uit Shopify:", res.status, text);
-    throw new Error(`Shopify ${res.status}: ${text}`);
-  }
-
-  const data = await res.json();
-  return data.order;
-}
-
 // ---------------- ROUTES ----------------
 
 // Healthcheck
@@ -224,19 +210,22 @@ app.get("/", (req, res) => {
   res.json({ ok: true, service: "Shopify → WebStock", time: new Date() });
 });
 
-// Bestaande orders-updated webhook (mag blijven staan)
+// Webhook: orders-updated
+// → wordt aangeroepen bij "Updaten van bestelling" in Shopify
 app.post(
   "/webhooks/shopify/orders-updated",
   express.raw({ type: "application/json" }),
-  (req, res) => {
+  async (req, res) => {
     const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
-    const rawBody = req.body;
+    const rawBody = req.body; // Buffer
 
+    // 1) HMAC check
     if (!verifyShopifyHmac(rawBody, hmacHeader)) {
       console.warn("❌ Ongeldige Shopify webhook (orders-updated)");
       return res.status(401).send("Unauthorized");
     }
 
+    // 2) Parse JSON
     let order;
     try {
       order = JSON.parse(rawBody.toString());
@@ -245,56 +234,23 @@ app.post(
       return res.status(400).send("Invalid JSON");
     }
 
-    console.log("📦 (orders-updated) Webhook ontvangen voor order:", order.name);
-    console.log("ℹ️ Deze route stuurt niks door naar WebStock (alleen logging).");
-    res.status(200).send("OK");
-  }
-);
+    console.log("📦 Webhook ontvangen voor order:", order.name);
+    console.log("🔎 fulfillment_status:", order.fulfillment_status);
+    console.log("🔎 financial_status:", order.financial_status);
+    console.log("🔎 closed_at:", order.closed_at);
 
-// NIEUW: fulfilment-update webhook
-app.post(
-  "/webhooks/shopify/fulfillments-update",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    const hmacHeader = req.get("X-Shopify-Hmac-Sha256");
-    const rawBody = req.body;
+    // 3) Alleen triggeren als fulfillment echt "fulfilled" is
+    const isFulfilled = order.fulfillment_status === "fulfilled";
 
-    if (!verifyShopifyHmac(rawBody, hmacHeader)) {
-      console.warn("❌ Ongeldige Shopify webhook (fulfillments-update)");
-      return res.status(401).send("Unauthorized");
-    }
-
-    let fulfillment;
-    try {
-      fulfillment = JSON.parse(rawBody.toString());
-    } catch (err) {
-      console.error("❌ JSON parse error:", err);
-      return res.status(400).send("Invalid JSON");
-    }
-
-    console.log("📦 Fulfilment-webhook ontvangen:", fulfillment.id);
-
-    const status = fulfillment.status;
-    console.log("🔎 Fulfilment status:", status);
-
-    const isInExecution =
-      status === "in_progress" ||
-      status === "open" ||
-      status === "pending";
-
-    if (!isInExecution) {
-      console.log("ℹ️ Fulfilment is niet 'in uitvoering' → geen WebStock push.");
+    if (!isFulfilled) {
+      console.log(
+        "ℹ️ Order fulfillment is niet 'fulfilled' → geen WebStock push."
+      );
       return res.status(200).send("No action");
     }
 
+    // 4) Bouw WebStock-order en stuur
     try {
-      const orderId = fulfillment.order_id;
-      console.log("🔎 Haal order op uit Shopify:", orderId);
-
-      const order = await fetchShopifyOrder(orderId);
-
-      console.log("🧾 Order gevonden:", order.name);
-
       const payload = buildWebStockOrderFromShopify(order);
       console.log(
         "🚀 Verstuur naar WebStock:",
@@ -305,14 +261,15 @@ app.post(
 
       await sendOrderToWebStock(payload);
 
-      res.status(200).send("Order sent to WebStock via fulfilment");
+      res.status(200).send("Order sent to WebStock (orders-updated)");
     } catch (err) {
-      console.error("❌ Fout in fulfilment-handler:", err);
+      console.error("❌ Fout tijdens WebStock push:", err);
       res.status(500).send("Server error");
     }
   }
 );
 
+// Start server
 app.listen(PORT, () => {
   console.log(`🚀 Server draait op poort ${PORT}`);
 });
