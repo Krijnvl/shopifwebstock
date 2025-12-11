@@ -83,6 +83,44 @@ function verifyShopifyHmac(rawBody, hmacHeader) {
   }
 }
 
+// Helper om straat + huisnummer uit één string te halen
+// Voorbeelden die goed gaan:
+// "Wim Rotherlaan 25"      -> straat="Wim Rotherlaan", nr="25", toevoeging=""
+// "Hoofdstraat 12A"        -> straat="Hoofdstraat", nr="12", toevoeging="A"
+// "Kerklaan 10-3"          -> straat="Kerklaan", nr="10", toevoeging="-3"
+function splitStreetAndHouse(address) {
+  if (!address) {
+    return {
+      street: "",
+      houseNumber: "",
+      houseNumberAddition: "",
+    };
+  }
+
+  const trimmed = String(address).trim();
+
+  const match = trimmed.match(/^(.+?)\s+(\d{1,5})([A-Za-z0-9\-\/]*)\s*$/);
+
+  if (!match) {
+    // Als we niets herkennen: alles in straat, geen huisnummer
+    return {
+      street: trimmed,
+      houseNumber: "",
+      houseNumberAddition: "",
+    };
+  }
+
+  const street = match[1].trim();
+  const houseNumber = match[2].trim();
+  const houseNumberAddition = (match[3] || "").trim();
+
+  return {
+    street,
+    houseNumber,
+    houseNumberAddition,
+  };
+}
+
 // Eén line item uit Shopify → één orderregel in WebStock
 function mapLineItemToWebStockLine(item) {
   const { articleNumber, ean } = resolveArticleFromItem(item);
@@ -124,6 +162,19 @@ function buildWebStockOrderFromShopify(order) {
     "";
   const endCustomerPhone = shipping.phone || order.phone || "";
   const endCustomerEmail = order.email || order.contact_email || "";
+
+  // Straat + huisnummer uit address1 halen
+  const {
+    street: street2,
+    houseNumber: houseNo2,
+    houseNumberAddition: houseAddParsed2,
+  } = splitStreetAndHouse(shipping.address1 || "");
+
+  // Landcode (ISO), bv. "NL", "BE"
+  const countryCode2 = (shipping.country_code || "").toString().toUpperCase();
+
+  // Eventuele extra toevoeging uit address2 – vaak verdieping / unit
+  const houseAddition2 = shipping.address2 || houseAddParsed2;
 
   // Shopify ordernummer met prefix
   const finalOrderNumber = `${WEBSTOCK_ORDER_PREFIX}${order.order_number}`;
@@ -174,12 +225,12 @@ function buildWebStockOrderFromShopify(order) {
     Address2Name: endCustomerName,          // Naam / bedrijfsnaam
     AddressContactPerson2: endCustomerName, // Contactpersoon
     AddressAttention2: "",
-    AddressStreet2: shipping.address1 || "",
-    AddressHouseNumber2: "",                // kun je later nog gaan splitsen
-    AddressHouseNumberAddition2: "",
+    AddressStreet2: street2,                      // alleen straat
+    AddressHouseNumber2: houseNo2,               // alleen huisnummer
+    AddressHouseNumberAddition2: houseAddition2, // toevoeging / address2
     AddressZipcode2: shipping.zip || "",
     AddressCity2: shipping.city || "",
-    AddressCountry2: shipping.country || "",
+    AddressCountry2: countryCode2,               // landcode, bv. "NL", "BE"
     AddressPhonenumber2: endCustomerPhone,
     AddressEmail2: endCustomerEmail,
 
