@@ -11,14 +11,21 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // WebStock config
-const WEBSTOCK_BASE_URL = "https://altena.webstock.nl/wsapp/api/v1";
+const WEBSTOCK_BASE_URL = "https://altena.webstock.nl/WSApp/api/v1";
 const WEBSTOCK_USER = process.env.WEBSTOCK_USER;
 const WEBSTOCK_PASS = process.env.WEBSTOCK_PASS;
-const WEBSTOCK_WAREHOUSE = "Test";       // Test-magazijn
-const WEBSTOCK_ORDER_PREFIX = "GWT";     // Prefix voor SalesOrderNumber
+const WEBSTOCK_WAREHOUSE = "Test";         // Test-magazijn
+const WEBSTOCK_ORDER_PREFIX = "GWT";       // Prefix voor SalesOrderNumber
 
-// Shopify webhook secret (van je webhook in Shopify)
+// Hoofdklant in WebStock (beatbox-leverancier)
+const WEBSTOCK_MAIN_CUSTOMER_NUMBER = "Cust001266";
+const WEBSTOCK_MAIN_CUSTOMER_NAME = "GWT-SBG BV";
+
+// Shopify webhook secret (Admin → Meldingen → Webhooks)
 const SHOPIFY_WEBHOOK_SECRET = process.env.SHOPIFY_WEBHOOK_SECRET;
+
+// Simpele set om te voorkomen dat we dezelfde order meerdere keren pushen
+const sentOrders = new Set();
 
 // ---------------- PRODUCT MAPPING (TITEL → EAN) ----------------
 //
@@ -86,7 +93,7 @@ function mapLineItemToWebStockLine(item) {
     ArticleId: 0,
     ArticleExternId: 0,
     ArticleExternGuid: "",
-    ArticleNumber: articleNumber,    // EAN als artikelnummer
+    ArticleNumber: articleNumber, // EAN als artikelnummer
     Eancode: ean,
     PackagingUnit: "st",
     PackagingQuantity: 1,
@@ -109,11 +116,17 @@ function buildWebStockOrderFromShopify(order) {
   const shipping = order.shipping_address || {};
   const customer = order.customer || {};
 
-  const finalOrderNumber = `${WEBSTOCK_ORDER_PREFIX}${order.order_number}`;
-  const customerName =
-    `${customer.first_name || ""} ${customer.last_name || ""}`.trim() ||
+  // Eindklant (ontvanger) uit Shopify
+  const endCustomerName =
+    shipping.company ||
+    `${shipping.first_name || ""} ${shipping.last_name || ""}`.trim() ||
     shipping.name ||
-    order.name;
+    "";
+  const endCustomerPhone = shipping.phone || order.phone || "";
+  const endCustomerEmail = order.email || order.contact_email || "";
+
+  // Shopify ordernummer met prefix
+  const finalOrderNumber = `${WEBSTOCK_ORDER_PREFIX}${order.order_number}`;
 
   return {
     // Externe referenties
@@ -123,13 +136,14 @@ function buildWebStockOrderFromShopify(order) {
 
     // Orderheader
     SalesOrderNumber: finalOrderNumber,
-    Status: 10, // New
+    Status: 10, // "Nieuw"
 
+    // HOOFDKLANT = GWT-SBG BV
     CustomerId: 0,
-    CustomerNumber: customer.id ? String(customer.id) : "",
-    CustomerName: customerName,
-    CustomerContact: shipping.name || "",
-    CustomerEmail: order.email || order.contact_email || "",
+    CustomerNumber: WEBSTOCK_MAIN_CUSTOMER_NUMBER,
+    CustomerName: WEBSTOCK_MAIN_CUSTOMER_NAME,
+    CustomerContact: "", // eventueel contactpersoon bij GWT-SBG, nu leeg
+    CustomerEmail: "",   // eventueel facturatie e-mail, nu leeg
 
     ProjectName: "",
     ProjectDescription: "",
@@ -137,37 +151,37 @@ function buildWebStockOrderFromShopify(order) {
     HandlingDate: null,
     ReadyDate: null,
 
-    CustomerReference: order.name, // bijv. "#1001"
+    CustomerReference: order.name, // bv. "#BB_1021"
     SalesOrderDescription: `Shopify order ${order.name}`,
 
     DeliveryTerms: "",
     ShippingDetails: "",
     SalesOrderDocuments: "",
 
-    // Adres 1 = shipping address
-    AddressContactPerson1: shipping.name || "",
+    // Address 1: leeg laten → WebStock kan standaardadres klant gebruiken
+    AddressContactPerson1: "",
     AddressAttention1: "",
-    AddressStreet1: shipping.address1 || "",
+    AddressStreet1: "",
     AddressHouseNumber1: "",
     AddressHouseNumberAddition1: "",
-    AddressZipcode1: shipping.zip || "",
-    AddressCity1: shipping.city || "",
-    AddressCountry1: shipping.country || "",
-    AddressPhonenumber1: shipping.phone || order.phone || "",
-    AddressEmail1: order.email || order.contact_email || "",
+    AddressZipcode1: "",
+    AddressCity1: "",
+    AddressCountry1: "",
+    AddressPhonenumber1: "",
+    AddressEmail1: "",
 
-    // Adres 2 leeg
-    Address2Name: "",
-    AddressContactPerson2: "",
+    // Address 2: EINDKLANT / ONTVANGER UIT SHOPIFY (afwijkend afleveradres)
+    Address2Name: endCustomerName,          // Naam / bedrijfsnaam
+    AddressContactPerson2: endCustomerName, // Contactpersoon
     AddressAttention2: "",
-    AddressStreet2: "",
-    AddressHouseNumber2: "",
+    AddressStreet2: shipping.address1 || "",
+    AddressHouseNumber2: "",                // kun je later nog gaan splitsen
     AddressHouseNumberAddition2: "",
-    AddressZipcode2: "",
-    AddressCity2: "",
-    AddressCountry2: "",
-    AddressPhonenumber2: "",
-    AddressEmail2: "",
+    AddressZipcode2: shipping.zip || "",
+    AddressCity2: shipping.city || "",
+    AddressCountry2: shipping.country || "",
+    AddressPhonenumber2: endCustomerPhone,
+    AddressEmail2: endCustomerEmail,
 
     WareHouse: WEBSTOCK_WAREHOUSE,
 
@@ -248,6 +262,15 @@ app.post(
       );
       return res.status(200).send("No action");
     }
+
+    // 3b) Check: hebben we deze order al eerder verstuurd?
+    if (sentOrders.has(order.id)) {
+      console.log(
+        "⛔ Order is al eerder naar WebStock verstuurd → sla deze call over."
+      );
+      return res.status(200).send("Already sent");
+    }
+    sentOrders.add(order.id);
 
     // 4) Bouw WebStock-order en stuur
     try {
